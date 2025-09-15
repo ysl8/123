@@ -1,0 +1,272 @@
+pipeline {
+    agent {
+        label 'gmp-fms'
+    }
+
+
+    parameters {
+       choice choices: ['esit', 'test', 'dev', 'dev2', 'dev3', 'sec'], description: '选择分支', name: 'BRANCH'
+       choice choices: ['no', 'yes'], description: '构建PEVC包', name: 'PEVC'
+       choice choices: ['no', 'yes'], description: '是否部署到k8s-22.198环境', name: 'k8s-22.198'
+       choice choices: ['no', 'yes'], description: '是否部署到k8s-112.76环境', name: 'k8s-112.76'
+       choice choices: ['no', 'yes'], description: 'SONAR代码扫描', name: 'SONAR'
+       choice choices: ['no', 'yes'], description: '是否部署研发环境？', name: 'UPLOAD'
+       choice choices: ['no', 'yes'], description: '是否部署仿真环境？', name: 'SIM'              
+       choice choices: ['no', 'yes'], description: '是否测试使用JDK21来构建包', name: 'CI-JDK21'
+       choice choices: ['no', 'yes'], description: '是否摆渡到仿真', name: 'cpjob'
+    }
+
+    environment {
+
+
+
+        app = 'fss-cba'
+        dest='172.16.112.27'
+
+        //项目gitlaburl地址
+        url = 'http://172.16.99.14/jrkj-root-code/csgf/fss-cba.git'
+        //后端服务器地址
+        server = '172.16.112.120'
+        sonarqubescannerhome = tool name: 'sonar-scanner'
+        KEY = "${env.JOB_NAME}".replace('/',':').toLowerCase()    
+    }
+    tools {
+        maven 'maven-3.8.3'
+
+        jdk 'jdk8'
+    }   
+    stages {
+        stage('拉取代码') {
+            steps {
+                cleanWs()
+                git branch: "${BRANCH}", credentialsId: '7c513a5f-d5cb-4250-a57d-f7df9739acd7', url: "${url}"
+            }
+        }
+
+        stage('环境设置') {
+            steps {
+               script {
+                   sh(script: "$HOME/.deployc/build_pre.sh", returnStdout: true)
+                   
+               } 
+            }
+        }
+
+
+                stage('CI-JDK21') {
+                    when {
+                        environment name: 'CI-JDK21',value: 'yes'
+                    }
+                    steps {
+                        sh '''
+
+                        source $HOME/.deployc/build_pre.sh
+                        export JAVA_HOME=$JDK21_HOME PATH=$JDK21_HOME/bin:$PATH
+                        java -version
+						
+                       # mvn clean compile package -Dmaven.test.skip=true -s $SETTING
+                        mvn clean  dependency:tree  package -Dmaven.test.skip=true -U -f pom.xml -s $SETTING
+
+
+
+                        '''
+                    }
+                }
+				
+                stage('构建WAR包') {
+                    steps {
+                        sh '''
+                        source $HOME/.deployc/build_pre.sh
+                        #mvn clean 
+                        mvn clean  dependency:tree  package -Dmaven.test.skip=true -U -f pom.xml -s $SETTING
+                        #mvn dependency:tree compile package -Dmaven.test.skip=true -s $SETTING
+
+
+mkdir -p _target_dir
+cat > _target_dir/run.sh <<-"EOF"
+set -x
+catalina.sh run
+EOF
+
+ls -alh _target_dir/run.sh
+
+cat  _target_dir/run.sh
+
+
+
+                        '''
+                    }
+                }
+
+        //构建步骤
+        stage('并行') {
+            parallel {
+
+                stage('代码扫描') {
+                    when {
+                        environment name: 'SONAR',value: 'yes'
+                    }
+                    steps {
+                        echo KEY
+                        sh ''' 
+                        cat > sonar-project.properties << eof
+                        sonar.projectKey=${KEY}
+                        sonar.projectName=${KEY}
+                        sonar.projectVersion=$BUILD_ID
+                        sonar.sources=.
+                        sonar.sourceEncoding=UTF-8
+                        sonar.java.binaries=.
+                        eof
+                        '''
+
+                        withSonarQubeEnv('SonarQube') {
+                            sh "${sonarqubescannerhome}/bin/sonar-scanner -X"
+                        }
+                    }
+                }
+                
+            }
+        }
+
+        stage('检查处理') {
+            steps {
+               script {
+                   sh(script: "$HOME/.deployc/build_post.sh", returnStdout: true)
+                   
+               } 
+            }
+        }
+        stage('发布PEVC包') {
+             when {
+                environment name: 'PEVC',value: 'yes'
+            }           
+            steps {
+                sh '''
+                echo "构建PEVC包，发布到112.27"
+                echo PWD: $PWD
+                cd ./_target_dir
+                ls -alh
+                cat meta.yaml  || true 
+                cat checksum.txt  || true 
+                base64 checksum.txt.gpg || true
+                name=$(grep name meta.yaml| awk '{print $NF}')
+                version=$(grep version meta.yaml| awk '{print $NF}')
+                tag=$(grep version meta.yaml| awk '{print $NF}'| awk -F'-' '{print $1}')
+
+                ssh -p 10022  -o StrictHostKeyChecking=no -i $HOME/.deployc/id_deploy root@${dest} "mkdir -p /data/release/$JOB_BASE_NAME/$name-[${BUILD_ID}]-$version"
+                scp -P 10022 -r -o StrictHostKeyChecking=no -i $HOME/.deployc/id_deploy * root@${dest}:/data/release/$JOB_BASE_NAME/$name-[${BUILD_ID}]-$version/
+
+                '''
+            }
+        }
+
+        stage('部署k8s-22.198') {
+            when {
+                environment name: 'k8s-22.198',value: 'yes'
+            }
+            steps {
+                sh '''
+                cd ./_target_dir
+                ls  -lhtr
+                pwd
+                scp -P 10022 -o StrictHostKeyChecking=no -i $HOME/.deployc/id_deploy *.*ar ops1@172.16.22.196:/data/war/fss-cba/
+                ssh -p 10022  -o StrictHostKeyChecking=no -i $HOME/.deployc/id_deploy ops1@172.16.22.196 "bash /data/01deploy/01sh/k8sdepapp.sh fss-cba"
+
+                '''
+            }
+        }
+
+
+        stage('部署k8s-112.76') {
+            when {
+                environment name: 'k8s-112.76',value: 'yes'
+            }
+            steps {
+                sh '''
+                cd ./_target_dir
+                scp -P 10022 -o StrictHostKeyChecking=no -i $HOME/.deployc/id_deploy *.*ar root@172.16.112.54:/data/m1/upload/csgf/${app}/
+                ssh -p 10022  -o StrictHostKeyChecking=no -i $HOME/.deployc/id_deploy root@172.16.112.54 "bash /data/m1/upload/csgf/makejenkins.sh ${app}"
+                ssh -p 10022  -o StrictHostKeyChecking=no -i $HOME/.deployc/id_deploy root@172.16.112.54 "kubectl delete -f /data/m1/upload/csgf/${app1}/${app}.yaml || true"
+                ssh -p 10022  -o StrictHostKeyChecking=no -i $HOME/.deployc/id_deploy root@172.16.112.54 "kubectl apply -f /data/m1/upload/csgf/${app1}/${app}.yaml"
+                '''
+            }
+        }
+		
+        stage('部署研发') {
+            when {
+                environment name: 'UPLOAD',value: 'yes'
+            }
+            steps {
+                sh '''
+                cd ./_target_dir
+                scp -P 10022 -o StrictHostKeyChecking=no -i $HOME/.deployc/id_deploy *.*ar root@${server}:/app/war/
+                ssh -p 10022  -o StrictHostKeyChecking=no -i $HOME/.deployc/id_deploy root@${server} "systemctl restart fssbp"
+                '''
+            }
+        }
+        stage('上传仿真') {
+            when {
+                environment name: 'SIM',value: 'yes'
+            }
+            steps {
+                sh '''
+                HOST=172.16.111.119
+                PORT=2222
+                USER="jrywxt_sftp"
+                PASS="Jrywxt_&pwd"
+                echo "Starting to upload war..."
+                cd ./_target_dir
+                lftp -u $USER,$PASS  sftp://$HOST:$PORT << EOF
+                cd /upload/$JOB_BASE_NAME || mkdir -p /upload/$JOB_BASE_NAME && cd /upload/$JOB_BASE_NAME
+                mput *.*ar    
+                bye
+                
+                EOF
+                echo "Upload done"
+                '''
+            }
+        }
+        stage('摆渡到仿真') {
+            when {
+                environment name: 'cpjob',value: 'yes'
+            }
+            steps{
+              sh '''
+              cd ./_target_dir
+              tar czvf ${WORKSPACE}/_target_dir/.tar.gz ./*.*ar
+              '''
+              build(
+                wait: false,
+                propagate: false,
+                job: "jrywxt/cpjob",  //摆渡任务名
+                parameters: [
+                  string(name:'node',value:"$NODE_LABELS"),
+                  string(name:'filename',value:"${WORKSPACE}/_target_dir/fss-cba.tar.gz"),
+                  string(name:'project_code',value:"JY-2018-256"),
+                  string(name:'adminEmail',value:"sushuhui@csg.dev"),
+                  string(name:'adminUser',value:"sushuhui"),
+                  string(name:'job_name',value:"${JOB_NAME}")
+                  //string(name:' work_order_number ',value:"[31m工单号[0m") //如果摆渡系统的源代码，需要填写相应的IOS工单号
+                ]
+              )
+            }
+        }
+
+
+
+
+
+
+        stage('构建检查') {
+            steps {
+                sh(script: "$HOME/.deployc/build_check.sh", returnStdout: true)
+                sh '''
+                  cat _target_dir/ver.txt
+                  echo "Done"
+                '''
+            }
+        }
+
+
+    }
+}
